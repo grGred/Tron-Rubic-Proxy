@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.6;
 
 /**
 
@@ -14,7 +14,9 @@ pragma solidity ^0.8.0;
 */
 
 import 'rubic-bridge-base/contracts/architecture/OnlySourceFunctionality.sol';
-import 'rubic-bridge-base/contracts/libraries/SmartApprove.sol';
+import '@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol';
+import '@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol';
+import 'rubic-bridge-base/contracts/errors/Errors.sol';
 
 error DifferentAmountSpent();
 error RouterNotAvailable();
@@ -59,28 +61,27 @@ contract RubicProxy is OnlySourceFunctionality {
     }
 
     function routerCall(
+        string calldata _providerInfo,
         BaseCrossChainParams calldata _params,
         address _gateway,
         bytes calldata _data
-    ) external payable nonReentrant whenNotPaused eventEmitter(_params) {
+    ) external payable nonReentrant whenNotPaused eventEmitter(_params, _providerInfo) {
         if (!(availableRouters.contains(_params.router) && availableRouters.contains(_gateway))) {
             revert RouterNotAvailable();
         }
+
+        uint256 balanceBeforeTransfer = IERC20Upgradeable(_params.srcInputToken).balanceOf(address(this));
         IERC20Upgradeable(_params.srcInputToken).safeTransferFrom(msg.sender, address(this), _params.srcInputAmount);
+        uint256 balanceAfterTransfer = IERC20Upgradeable(_params.srcInputToken).balanceOf(address(this));
+
+        // input amount for deflationary tokens
+        uint256 _amountIn = balanceAfterTransfer - balanceBeforeTransfer;
 
         IntegratorFeeInfo memory _info = integratorToFeeInfo[_params.integrator];
 
-        uint256 _amountIn = accrueTokenFees(
-            _params.integrator,
-            _info,
-            _params.srcInputAmount,
-            0,
-            _params.srcInputToken
-        );
+        _amountIn = accrueTokenFees(_params.integrator, _info, _amountIn, 0, _params.srcInputToken);
 
-        SmartApprove.smartApprove(_params.srcInputToken, _amountIn, _gateway);
-
-        uint256 balanceBefore = IERC20Upgradeable(_params.srcInputToken).balanceOf(address(this));
+        SafeERC20Upgradeable.safeIncreaseAllowance(IERC20Upgradeable(_params.srcInputToken), _gateway, _amountIn);
 
         AddressUpgradeable.functionCallWithValue(
             _params.router,
@@ -88,18 +89,21 @@ contract RubicProxy is OnlySourceFunctionality {
             accrueFixedCryptoFee(_params.integrator, _info)
         );
 
-        if (balanceBefore - IERC20Upgradeable(_params.srcInputToken).balanceOf(address(this)) != _amountIn) {
+        if (balanceAfterTransfer - IERC20Upgradeable(_params.srcInputToken).balanceOf(address(this)) != _amountIn) {
             revert DifferentAmountSpent();
+        }
+
+        // reset allowance back to zero, just in case
+        if (IERC20Upgradeable(_params.srcInputToken).allowance(address(this), _gateway) > 0) {
+            IERC20Upgradeable(_params.srcInputToken).safeApprove(_gateway, 0);
         }
     }
 
-    function routerCallNative(BaseCrossChainParams calldata _params, bytes calldata _data)
-        external
-        payable
-        nonReentrant
-        whenNotPaused
-        eventEmitter(_params)
-    {
+    function routerCallNative(
+        string calldata _providerInfo,
+        BaseCrossChainParams calldata _params,
+        bytes calldata _data
+    ) external payable nonReentrant whenNotPaused eventEmitter(_params, _providerInfo) {
         if (!availableRouters.contains(_params.router)) {
             revert RouterNotAvailable();
         }
